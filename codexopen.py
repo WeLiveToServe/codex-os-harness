@@ -9,12 +9,22 @@ that inject incompatible Responses tool payloads.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-from open_harness_common import LaunchTarget, openrouter_target, resolve_locked_model, run_interactive
+from open_harness_common import (
+    LaunchTarget,
+    configured_openrouter_models,
+    openrouter_listing_target,
+    openrouter_target,
+    resolve_openrouter_model,
+    run_interactive,
+)
 
 COMPAT_DISABLE_FEATURES = [
     "apps",
@@ -58,9 +68,78 @@ def _build_codex_cmd(target: LaunchTarget, cwd: str, model: str, passthrough: li
     return cmd
 
 
+def _parse_openrouter_model_ids(raw_body: bytes) -> list[str]:
+    payload = json.loads(raw_body.decode("utf-8"))
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+
+    model_ids: list[str] = []
+    seen: set[str] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id", "")).strip()
+        if model_id and model_id not in seen:
+            model_ids.append(model_id)
+            seen.add(model_id)
+    return model_ids
+
+
+def _fetch_openrouter_model_ids(target: LaunchTarget, *, include_auth: bool) -> list[str]:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "codex-os-harness/codexopen",
+    }
+    if include_auth:
+        headers["Authorization"] = f"Bearer {target.env_key_value}"
+
+    request = urllib.request.Request(f"{target.base_url.rstrip('/')}/models", headers=headers)
+    with urllib.request.urlopen(request, timeout=12) as response:
+        return _parse_openrouter_model_ids(response.read())
+
+
+def list_openrouter_model_ids(target: LaunchTarget) -> tuple[list[str], str]:
+    errors: list[str] = []
+    attempts = [True, False] if target.env_key_value else [False]
+
+    for include_auth in attempts:
+        try:
+            model_ids = _fetch_openrouter_model_ids(target, include_auth=include_auth)
+        except urllib.error.HTTPError as exc:
+            auth_note = "with auth" if include_auth else "without auth"
+            errors.append(f"{auth_note}: HTTP {exc.code}")
+            continue
+        except Exception as exc:
+            auth_note = "with auth" if include_auth else "without auth"
+            errors.append(f"{auth_note}: {exc.__class__.__name__}")
+            continue
+
+        if model_ids:
+            source = "openrouter"
+            if not include_auth:
+                source = "openrouter unauthenticated"
+            return model_ids, source
+        errors.append("remote returned no model IDs")
+
+    fallback = configured_openrouter_models()
+    detail = "; ".join(errors) if errors else "remote unavailable"
+    return fallback, f"configured fallback ({detail})"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Launch Codex routed to OpenRouter.")
-    parser.add_argument("--model", default="", help="Ignored unless set to locked model openai/gpt-oss-120b:free.")
+    parser.add_argument(
+        "--model",
+        default="",
+        metavar="OPENROUTER_MODEL_ID",
+        help="Full OpenRouter model ID to launch, for example qwen/qwen3.6-plus.",
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="Print available OpenRouter model IDs, one per line.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -68,9 +147,22 @@ def main() -> int:
     )
     args, passthrough = parser.parse_known_args()
 
+    if args.list_models:
+        target = openrouter_listing_target()
+        model_ids, source = list_openrouter_model_ids(target)
+        print(f"[codexopen] model_source={source} count={len(model_ids)}", file=sys.stderr)
+        for model_id in model_ids:
+            print(model_id)
+        return 0
+
     try:
         target = openrouter_target()
-        model = resolve_locked_model(args.model)
+    except Exception as exc:
+        print(f"[codexopen] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        model = resolve_openrouter_model(args.model)
     except Exception as exc:
         print(f"[codexopen] {exc}", file=sys.stderr)
         return 1
